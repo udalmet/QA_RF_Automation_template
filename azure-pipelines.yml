@@ -1,0 +1,345 @@
+# *************************************************************************************
+# This is a sample example of azure-pipeline used for Settlement2.0 project
+# Modify it as per your requirement
+# Note that you need to add/modify credential/secrets/variables in azure as per your requirement
+# *************************************************************************************
+trigger: none        # run manually
+pr: none
+
+schedules:
+# Option A (exact “every week Monday  06:00 PM ETC” → 11:00 UTC Monday)
+- cron: "0 23 * * Mon"
+  displayName: Weekly - Mon 06:00 PM ETC (11:00 UTC)
+  branches:
+    include:
+    - master
+  always: true
+
+pool:
+  name: Promotion Services Build Agent Pool
+  demands:
+    - agent.name -equals QAAutomation
+
+# ───────────────────────────────────────────
+# share pip wheel cache between jobs (optional)
+# ───────────────────────────────────────────
+variables:
+  PIP_DOWNLOAD_CACHE: $(Agent.ToolsDirectory)\_pipcache
+  JobTimeout: 900   # timeout in minutes (default 3 hours)
+
+  # ───────────────────────────────────────────────────
+  # BigQuery project for creds.robot (used by Sett_BigQueryKeywords)
+  # ───────────────────────────────────────────────────
+  SettProj: inm-mfg-cs-qa
+
+jobs:
+- job: RunRobotTests
+  timeoutInMinutes: $[variables.JobTimeout]   # configurable job timeout
+  steps:
+    # ───────────────────────────────────────────
+    # 0) Checkout repo
+    # ───────────────────────────────────────────
+    - checkout: self
+      displayName: Checkout source
+
+    # ───────────────────────────────────────────
+    # 1) Put agent’s Python 3.10 first on PATH
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Activate cached Python 3.10.4
+      inputs:
+        targetType: inline
+        script: |
+          $pyRoot = 'F:\AzureDevops-BuildAgent-QAAutomation\_work\_tool\Python\3.10.4\x64'
+          if (-not (Test-Path "$pyRoot\python.exe")) {
+            Write-Host "##vso[task.logissue type=error]Python 3.10.4 not found at $pyRoot"
+            exit 1
+          }
+          Write-Host "Found Python 3.10 → $pyRoot\python.exe"
+          Write-Host "##vso[task.setvariable variable=PATH]$pyRoot;$Env:PATH"
+          & "$pyRoot\python.exe" -V
+
+    # ───────────────────────────────────────────
+    # 2) Runtime-install helper tools (no browsers)
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Install build helpers with Chocolatey
+      inputs:
+        targetType: inline
+        script: |
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Write-Host "Chocolatey not present – skipping helper installs."
+            exit 0
+          }
+          function Ensure-Choco ($name) {
+            if (choco list --localonly | Select-String "^$name ") {
+              "✓ $name already installed"
+            } else {
+              choco install $name -y --no-progress
+            }
+          }
+          Ensure-Choco vcredist140
+          Ensure-Choco poppler
+          Ensure-Choco 7zip
+          Ensure-Choco gcloudsdk
+
+    # ───────────────────────────────────────────
+    # 2.1) Install Google Cloud SDK
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Install Google Cloud SDK
+      inputs:
+        targetType: inline
+        script: |
+          $installer = "$Env:TEMP\gcloud-installer.exe"
+          Invoke-WebRequest `
+            -Uri "https://dl.google.com/dl/cloudsdk/channels/rapid/GoogleCloudSDKInstaller.exe" `
+            -OutFile $installer
+          Start-Process -FilePath $installer `
+            -ArgumentList "/S","/D=$Env:ProgramFiles\Google\Cloud SDK" `
+            -NoNewWindow -Wait
+
+          # Add to PATH for this session and downstream steps
+          $gbin = "$Env:ProgramFiles\Google\Cloud SDK\google-cloud-sdk\bin"
+          Write-Host "##vso[task.prependpath]$gbin"
+          $Env:PATH = "$gbin;$Env:PATH"
+
+    # ───────────────────────────────────────────
+    # 2.2) Verify gcloud installation
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Verify gcloud is on the PATH
+      inputs:
+        targetType: inline
+        script: |
+          gcloud --version
+
+    # ───────────────────────────────────────────
+    # 2.3) Authenticate gcloud CLI with service account
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Authenticate gcloud CLI with service account
+      inputs:
+        targetType: inline
+        script: |
+          # 1) Write the service-account key from the pipeline secret to disk
+          $saJson = '$(GCP_SA_KEY)'
+          $saPath = Join-Path $Env:TEMP 'gcp-service-account.json'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText($saPath, $saJson, $utf8NoBom)
+
+          # 2) Export for both gcloud and any ADC‐using libraries
+          Write-Host "##vso[task.setvariable variable=GOOGLE_APPLICATION_CREDENTIALS]$saPath"
+          $Env:GOOGLE_APPLICATION_CREDENTIALS = $saPath
+
+          # 3) Activate the service account non-interactively
+          gcloud auth activate-service-account --key-file="$saPath" --project=inm-mfg-cs-qa
+
+    # ───────────────────────────────────────────
+    # 3) Create venv & install requirements
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Create venv + pip install
+      inputs:
+        targetType: inline
+        script: |
+          python -m venv .venv
+
+          # Use venv in this step
+          $venvScripts = "$(PWD)\.venv\Scripts"
+          $env:PATH = "$venvScripts;$env:PATH"
+
+          # Make venv Python first for ALL subsequent steps
+          Write-Host "##vso[task.prependpath]$venvScripts"
+          Write-Host "##vso[task.setvariable variable=VENV_PY]$venvScripts\python.exe"
+
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+
+    # ───────────────────────────────────────────
+    # 4) Point at your entire tests folder
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Locate Robot test directory
+      inputs:
+        targetType: inline
+        script: |
+          # if all your .robot files live under Tests\ or under the repo root, pick that:
+          $testRoot = "$(Build.SourcesDirectory)\Tests"
+          if (-not (Test-Path $testRoot)) {
+            Write-Host "Folder $testRoot not found, falling back to repo root"
+            $testRoot = "$(Build.SourcesDirectory)"
+          }
+          Write-Host "Using Robot test root: $testRoot"
+          Write-Host "##vso[task.setvariable variable=ROBOT_ROOT]$testRoot"
+
+    # ───────────────────────────────────────────
+    # 5) Decode TLS & BigQuery secrets → temp
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      name: writePemFiles
+      displayName: Decode TLS & BQ files
+      inputs:
+        targetType: inline
+        script: |
+          $tmp = $Env:Agent_TempDirectory
+          $certPath = Join-Path $tmp 'client-cert.pem'
+          $keyPath  = Join-Path $tmp 'client-key.pem'
+          $caPath   = Join-Path $tmp 'server-ca.pem'
+          $bqPath   = Join-Path $tmp 'inm-mfg-cs-qa.json'
+
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String("$(sslCert_QaSett_B64)"))
+          [IO.File]::WriteAllBytes($keyPath,  [Convert]::FromBase64String("$(sslKey_QaSett_B64)"))
+          [IO.File]::WriteAllBytes($caPath,   [Convert]::FromBase64String("$(sslRootCert_QaSett_B64)"))
+          [IO.File]::WriteAllBytes($bqPath,   [Convert]::FromBase64String("$(BqKey_QaSett_B64)"))
+
+          Write-Host "##vso[task.setvariable variable=sslCert_QaSett]$certPath"
+          Write-Host "##vso[task.setvariable variable=sslKey_QaSett]$keyPath"
+          Write-Host "##vso[task.setvariable variable=sslRootCert_QaSett]$caPath"
+          Write-Host "##vso[task.setvariable variable=settEnvPath]$bqPath"
+
+    # ───────────────────────────────────────────
+    # 6) Generate Common/creds.robot
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Create creds.robot with pipeline secrets
+      inputs:
+        targetType: inline
+        script: |
+          # helper: left-pad to 25 chars, two spaces, value
+          function Add-Var([string]$name, [string]$value) {
+            return ("{0,-25}  {1}" -f $name, $value)
+          }
+
+          $credsPath = Join-Path $Env:BUILD_SOURCESDIRECTORY 'Common\creds.robot'
+          New-Item -Force -ItemType Directory -Path (Split-Path $credsPath) | Out-Null
+
+          # forward-slash paths for Postgres and BigQuery JSON
+          $certFwd    = $Env:sslCert_QaSett     -replace '\\','/'
+          $keyFwd     = $Env:sslKey_QaSett      -replace '\\','/'
+          $caFwd      = $Env:sslRootCert_QaSett -replace '\\','/'
+          $bqFwd      = $Env:settEnvPath        -replace '\\','/'
+
+          $content  = @()
+          $content += '*** Variables ***'
+          $content += Add-Var '${DbName_QaSett}'      '$(DbName_QaSett)'
+          $content += Add-Var '${DbHost_QaSett}'      '$(DbHost_QaSett)'
+          $content += Add-Var '${DbPort_QaSett}'      '$(DbPort_QaSett)'
+          $content += Add-Var '${DbUsr_QaSett}'       '$(DbUsr_QaSett)'
+          $content += Add-Var '${DbPd_QaSett}'        '$(DbPd_QaSett)'
+          $content += Add-Var '${sslMode_QaSett}'     '$(sslMode_QaSett)'
+          $content += Add-Var '${sslCert_QaSett}'     $certFwd
+          $content += Add-Var '${sslKey_QaSett}'      $keyFwd
+          $content += Add-Var '${sslRootCert_QaSett}' $caFwd
+          $content += Add-Var '${settEnvPath}'        $bqFwd
+          $content += Add-Var '${SettProj}'           '$(SettProj)'
+          $content += Add-Var '${fromE}'              '$(fromE)'
+          $content += Add-Var '${fromPW}'             '$(fromPW)'
+          $content += Add-Var '${toE}'                '$(toE)'
+          $content += Add-Var '${sub}'                '$(sub)'
+          $content += Add-Var '${fromPM}'             '$(fromPM)'
+
+          $content | Set-Content -Path $credsPath -Encoding UTF8
+
+    # ───────────────────────────────────────────
+    # 7) Robot dry-run  (non-blocking)
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Robot dry-run
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          & "$(VENV_PY)" -m robot --dryrun "$(ROBOT_ROOT)"
+          exit 0
+
+    # ───────────────────────────────────────────
+    # 8) Run Robot + prepare BQ creds
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Run Robot + prepare BQ creds
+      continueOnError: true
+      inputs:
+        targetType: inline
+        script: |
+          # 1) Decode your BQ JSON again
+          $tmp    = $Env:Agent_TempDirectory
+          $bqPath = Join-Path $tmp 'inm-mfg-cs-qa.json'
+          [IO.File]::WriteAllBytes($bqPath, [Convert]::FromBase64String("$(BqKey_QaSett_B64)"))
+
+          # DEBUG: confirm JSON
+          if (Test-Path $bqPath) {
+            $info = Get-Item $bqPath
+            Write-Host "✅ BQ creds JSON → $bqPath ($($info.Length) bytes)"
+          } else {
+            Write-Host "❌ ERROR: BQ creds file not found at $bqPath"
+          }
+
+          # Show SettProj
+          Write-Host "🚀 SettProj = $(SettProj)"
+          $Env:SettProj = "$(SettProj)"
+
+          # Export settEnvPath for Robot
+          Write-Host "##vso[task.setvariable variable=settEnvPath]$bqPath"
+          $Env:settEnvPath = $bqPath
+          $Env:GOOGLE_APPLICATION_CREDENTIALS = $bqPath
+
+          # 3) Run Robot (choose one): output under reports\sett
+          $results = 'reports\sett'
+          New-Item -ItemType Directory -Path $results -Force | Out-Null
+
+          # (a) By test name (uncomment to use)
+          # & "$(VENV_PY)" -m robot `
+          #   -d $results `
+          #   --test "TC_010_Validate Remittance Data for Invoice Items only" `
+          #   -v SettProj:$(SettProj) `
+          #   -v settEnvPath:$bqPath `
+          #   $Env:ROBOT_ROOT
+
+          # (b) By tag (uncomment to use):
+          #     • include multiple tags: --include ErrorBillStatus,RemDataInvoice
+          #     • exclude tags:          --exclude slow,regression
+          # & "$(VENV_PY)" -m robot `
+          #   --removekeywords name:Sett_API_Common.* `
+          #   -i EndToEndReg `
+          #   -d $results `
+          #   -v SettProj:$(SettProj) `
+          #   -v settEnvPath:$bqPath `
+          #   "$(Build.SourcesDirectory)\main.robot"
+
+          # # (c) By file (uncomment to use)
+          # & "$(VENV_PY)" -m robot `
+          #   --removekeywords name:Sett_API_Common.* `
+          #   -d $results `
+          #   -v SettProj:$(SettProj) `
+          #   -v settEnvPath:$bqPath `
+          #   "$(Build.SourcesDirectory)\main.robot"
+
+          # 4) Export Robot exit code
+          Write-Host "##vso[task.setvariable variable=ROBOT_EXIT]$LASTEXITCODE"
+
+    # ───────────────────────────────────────────
+    # 9) Publish Robot HTML & other reports
+    # ───────────────────────────────────────────
+    - task: PublishPipelineArtifact@1
+      displayName: Publish Robot HTML & logs
+      condition: succeededOrFailed()
+      inputs:
+        targetPath: reports/sett
+        artifactName: RobotReports
+
+    # ───────────────────────────────────────────
+    # 10) Fail job only when Robot never executed
+    # ───────────────────────────────────────────
+    - task: PowerShell@2
+      displayName: Fail job if Robot never ran
+      condition: always()
+      inputs:
+        targetType: inline
+        script: |
+          $code = [int]$Env:ROBOT_EXIT
+          Write-Host "Robot exit-code: $code"
+          if ($code -ge 250) {
+            Write-Host "##vso[task.logissue type=error]Robot hit a fatal error or executed no tests."
+            exit 1
+          }
